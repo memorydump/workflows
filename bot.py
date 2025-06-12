@@ -328,19 +328,89 @@ You can now ask questions about your portfolio."""
         return latest_response, result
 
 
-# Example usage
-def main():
+def interactive_chat():
+    """Interactive command-line interface for the bond portfolio bot"""
+    print("🤖 Bond Portfolio Builder")
+    print("=" * 50)
+    print("I'll help you build a US bonds portfolio!")
+    print("You can specify:")
+    print("• Bond universe criteria (maturity, sector, ticker, rating, etc.)")
+    print("• Optimization constraints (duration, yield limits, etc.)")
+    print("• Type 'build portfolio' when ready to create your portfolio")
+    print("• Type 'status' to see current criteria")
+    print("• Type 'quit' or 'exit' to end")
+    print("=" * 50)
+    
     # Initialize the agent
     agent = BondPortfolioAgent(
-        api_key="your-openai-api-key",
+        api_key="your-openai-api-key",  # Replace with actual API key
         portfolio_api_endpoint="https://your-portfolio-api.com/build"
     )
     
-    # Example conversation
+    state = None
+    
+    while True:
+        try:
+            # Get user input
+            user_input = input("\n💬 You: ").strip()
+            
+            # Handle special commands
+            if user_input.lower() in ['quit', 'exit', 'q']:
+                print("\n👋 Thanks for using Bond Portfolio Builder!")
+                break
+            
+            if user_input.lower() == 'status':
+                if state:
+                    print(f"\n📊 Current Status:")
+                    print(f"Bond Universe Criteria: {len(state.get('bond_universe', []))}")
+                    for i, criteria in enumerate(state.get('bond_universe', []), 1):
+                        if hasattr(criteria, 'category'):
+                            print(f"  {i}. {criteria.category}: {criteria.value}")
+                        else:
+                            print(f"  {i}. {criteria}")
+                    
+                    print(f"Optimization Constraints: {len(state.get('optimization_constraints', []))}")
+                    for i, constraint in enumerate(state.get('optimization_constraints', []), 1):
+                        print(f"  {i}. {constraint}")
+                    
+                    print(f"Portfolio Built: {'Yes' if state.get('portfolio_built', False) else 'No'}")
+                else:
+                    print("\n📊 No criteria captured yet. Start by specifying bond characteristics!")
+                continue
+            
+            if not user_input:
+                print("Please enter a message or type 'quit' to exit.")
+                continue
+            
+            # Process the message through the agent
+            response, state = agent.chat(user_input, state)
+            
+            # Display bot response
+            print(f"\n🤖 Bot: {response}")
+            
+        except KeyboardInterrupt:
+            print("\n\n👋 Goodbye!")
+            break
+        except Exception as e:
+            print(f"\n❌ Error: {str(e)}")
+            print("Please try again or type 'quit' to exit.")
+
+
+def demo_conversation():
+    """Run a demo conversation with predefined messages"""
+    print("🎬 Running Demo Conversation")
+    print("=" * 50)
+    
+    # Initialize the agent
+    agent = BondPortfolioAgent(
+        api_key="demo-key",
+        portfolio_api_endpoint="https://demo-api.com/build"
+    )
+    
     state = None
     
     # Example interactions
-    examples = [
+    demo_messages = [
         "I want bonds with maturity between 5-10 years",
         "Add corporate bonds from technology sector", 
         "Include treasury bonds with AAA rating",
@@ -350,10 +420,39 @@ def main():
         "What's the average yield of my portfolio?"
     ]
     
-    for message in examples:
-        print(f"\nUser: {message}")
-        response, state = agent.chat(message, state)
-        print(f"Bot: {response}")
+    for message in demo_messages:
+        print(f"\n💬 User: {message}")
+        try:
+            response, state = agent.chat(message, state)
+            print(f"🤖 Bot: {response}")
+        except Exception as e:
+            print(f"❌ Error: {str(e)}")
+        
+        # Pause for readability
+        input("Press Enter to continue...")
+
+
+def main():
+    """Main function with options for interactive or demo mode"""
+    print("Bond Portfolio Builder")
+    print("1. Interactive Chat")
+    print("2. Demo Conversation")
+    print("3. Exit")
+    
+    while True:
+        choice = input("\nSelect option (1-3): ").strip()
+        
+        if choice == '1':
+            interactive_chat()
+            break
+        elif choice == '2':
+            demo_conversation()
+            break
+        elif choice == '3':
+            print("Goodbye!")
+            break
+        else:
+            print("Please enter 1, 2, or 3")
 
 
 if __name__ == "__main__":
