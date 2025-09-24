@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
+import openai
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +41,14 @@ app.add_middleware(
 ATLAS_API_KEY = os.getenv("ATLAS_API_KEY", "your-atlas-api-key")
 ATLAS_BASE_URL = os.getenv("ATLAS_BASE_URL", "https://atlas-api.your-domain.com")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-openai-api-key")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://your-custom-openai-endpoint.com/v1")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4")
+
+# Configure OpenAI client with custom URL
+openai_client = openai.AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL
+)
 
 # Pydantic Models
 class UserInput(BaseModel):
@@ -101,9 +110,85 @@ class IntentClassifier:
                 r'(show|get|find|fetch).*\b(portfolio|PT)\s+(trades?|positions?)\b'
             ]
         }
+        
+        self.system_prompt = """You are an expert intent classifier for a portfolio trade assistant. Analyze the user input and extract relevant parameters.
+
+Supported intents:
+1. TICKERIZE - User wants to perform tickerize action on portfolio trades
+
+For TICKERIZE intent, extract:
+- client: The client/firm name (e.g., 'pimco', 'blackrock', 'goldman', 'morgan stanley')
+- option: The option type ('bwic', 'owic') or keywords ('portfolio trades', 'PT trades')
+- additional_keywords: Any other relevant trading terms
+
+Respond ONLY in valid JSON format:
+{
+  "intent": "TICKERIZE|UNKNOWN",
+  "confidence": 0.0-1.0,
+  "parameters": {
+    "client": "extracted_client_name",
+    "option": "extracted_option_or_keywords",
+    "additional_keywords": ["keyword1", "keyword2"]
+  },
+  "reasoning": "Brief explanation"
+}
+
+Examples:
+- "tickerize pimco bwic" → {"intent": "TICKERIZE", "confidence": 0.95, "parameters": {"client": "pimco", "option": "bwic"}}
+- "show me blackrock portfolio trades" → {"intent": "TICKERIZE", "confidence": 0.90, "parameters": {"client": "blackrock", "option": "portfolio trades"}}
+- "get goldman PT trades" → {"intent": "TICKERIZE", "confidence": 0.85, "parameters": {"client": "goldman", "option": "PT trades"}}
+- "what's the weather?" → {"intent": "UNKNOWN", "confidence": 0.95, "parameters": {}}"""
     
     async def classify_intent(self, user_input: str) -> IntentResult:
-        """Classify user intent using pattern matching and LLM backup"""
+        """Classify user intent using OpenAI with pattern matching fallback"""
+        try:
+            # Try OpenAI classification first
+            return await self._openai_classify(user_input)
+        except Exception as e:
+            logger.warning(f"OpenAI classification failed: {e}, falling back to pattern matching")
+            # Fallback to pattern-based classification
+            return self._pattern_classify(user_input)
+    
+    async def _openai_classify(self, user_input: str) -> IntentResult:
+        """OpenAI-powered intent classification"""
+        try:
+            response = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_input}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            result_text = response.choices[0].message.content.strip()
+            
+            # Parse JSON response
+            try:
+                result_data = json.loads(result_text)
+                
+                return IntentResult(
+                    intent=IntentType(result_data.get("intent", "UNKNOWN")),
+                    confidence=float(result_data.get("confidence", 0.5)),
+                    parameters=IntentParameters(
+                        client=result_data.get("parameters", {}).get("client"),
+                        option=result_data.get("parameters", {}).get("option"),
+                        additional_keywords=result_data.get("parameters", {}).get("additional_keywords", [])
+                    ),
+                    reasoning=result_data.get("reasoning", "OpenAI classification")
+                )
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse OpenAI response: {result_text}, error: {e}")
+                # Fallback to pattern matching
+                return self._pattern_classify(user_input)
+                
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise e
+    
+    def _pattern_classify(self, user_input: str) -> IntentResult:
+        """Fallback pattern-based classification"""
         user_input_lower = user_input.lower()
         
         # Pattern-based classification
@@ -111,17 +196,22 @@ class IntentClassifier:
             for pattern in patterns:
                 if re.search(pattern, user_input_lower):
                     parameters = self._extract_parameters(user_input)
-                    confidence = 0.9 if parameters.client else 0.7
+                    confidence = 0.8 if parameters.client else 0.6
                     
                     return IntentResult(
                         intent=intent,
                         confidence=confidence,
                         parameters=parameters,
-                        reasoning=f"Matched pattern: {pattern}"
+                        reasoning=f"Pattern match fallback: {pattern}"
                     )
         
-        # If no pattern matches, try LLM classification (simplified version)
-        return await self._llm_classify(user_input)
+        # No pattern matches
+        return IntentResult(
+            intent=IntentType.UNKNOWN,
+            confidence=0.9,
+            parameters=IntentParameters(),
+            reasoning="No pattern matched, classified as unknown"
+        )
     
     def _extract_parameters(self, user_input: str) -> IntentParameters:
         """Extract parameters from user input"""
@@ -167,15 +257,8 @@ class IntentClassifier:
         )
     
     async def _llm_classify(self, user_input: str) -> IntentResult:
-        """Fallback LLM-based classification (simplified mock)"""
-        # In a real implementation, you'd call OpenAI API here
-        # For now, return unknown intent
-        return IntentResult(
-            intent=IntentType.UNKNOWN,
-            confidence=0.5,
-            parameters=IntentParameters(),
-            reasoning="No pattern matched, classified as unknown"
-        )
+        """Legacy method - now redirects to OpenAI classification"""
+        return await self._openai_classify(user_input)
 
 # ATLAS API Service
 class AtlasAPIService:
@@ -315,6 +398,61 @@ class ValidationService:
 
 # Response Formatter Service
 class ResponseFormatter:
+    def __init__(self):
+        self.system_prompt = """You are a helpful portfolio trade assistant. Format the provided portfolio trades information in a clear, professional manner for user selection.
+
+Guidelines:
+- Use clear numbering for each trade
+- Include all relevant trade details
+- Make it easy for users to identify and select trades
+- Use professional financial language
+- Be concise but informative
+- End with a clear call-to-action for user selection
+
+The user should be able to easily choose which trade(s) they want to proceed with."""
+    
+    async def format_trade_selection_stream_ai(self, trades: List[PortfolioTrade], client: str) -> AsyncGenerator[str, None]:
+        """AI-powered streaming trade formatting"""
+        try:
+            # Prepare trade data for AI formatting
+            trade_data = []
+            for i, trade in enumerate(trades, 1):
+                trade_info = {
+                    "number": i,
+                    "trade_id": trade.trade_id,
+                    "security_name": trade.security_name,
+                    "trade_type": trade.trade_type,
+                    "amount": trade.amount,
+                    "price": trade.price,
+                    "additional_info": trade.additional_info
+                }
+                trade_data.append(trade_info)
+            
+            context = f"Client: {client}, Found {len(trades)} portfolio trades"
+            
+            # Stream AI-formatted response
+            response = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": f"Format these portfolio trades for {client}:\n\n{json.dumps(trade_data, indent=2)}"}
+                ],
+                temperature=0.3,
+                max_tokens=1000,
+                stream=True
+            )
+            
+            async for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
+                    await asyncio.sleep(0.05)  # Small delay for streaming effect
+                    
+        except Exception as e:
+            logger.error(f"AI formatting failed: {e}, falling back to standard formatting")
+            # Fallback to standard formatting
+            async for content in self.format_trade_selection_stream(trades, client):
+                yield content
+    
     @staticmethod
     async def format_trade_selection_stream(trades: List[PortfolioTrade], client: str) -> AsyncGenerator[str, None]:
         """Stream formatted trades for user selection"""
@@ -347,7 +485,26 @@ class ResponseFormatter:
             yield trade_info
             await asyncio.sleep(0.2)  # Delay between trades for streaming effect
         
-        yield "Please select the trade number(s) you want to proceed with, or ask for more details about any specific trade."
+    async def format_error_response(self, error_message: str, context: str = "") -> str:
+        """AI-powered error message formatting"""
+        try:
+            prompt = f"Create a helpful, professional error response for a portfolio trade assistant. Error: {error_message}. Context: {context}. Include examples of correct usage."
+            
+            response = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a helpful portfolio trade assistant. Create professional, helpful error messages with clear guidance."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                max_tokens=300
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"AI error formatting failed: {e}")
+            return error_message  # Fallback to original error
     
     @staticmethod
     def format_trade_selection(trades: List[PortfolioTrade], client: str) -> str:
@@ -433,14 +590,10 @@ class PortfolioAssistant:
         validation = self.validator.validate_tickerize_parameters(intent_result.parameters)
         
         if not validation.valid:
-            error_message = "I need more information for the tickerize request:\n\n"
-            for error in validation.errors:
-                error_message += f"• {error}\n"
-            
-            error_message += "\nExamples:\n"
-            error_message += "• 'tickerize pimco bwic'\n"
-            error_message += "• 'show me blackrock portfolio trades'\n"
-            error_message += "• 'get goldman PT trades'"
+            error_message = await self.formatter.format_error_response(
+                f"Missing required parameters: {', '.join(validation.errors)}",
+                f"User request: {user_input}"
+            )
             
             yield self._create_stream_chunk("error", error_message, session_id=session_id)
             return
@@ -467,8 +620,8 @@ class PortfolioAssistant:
                 )
                 await asyncio.sleep(0.1)
                 
-                # Stream each part of the formatted response
-                async for content_chunk in self.formatter.format_trade_selection_stream(
+                # Stream each part of the formatted response using AI
+                async for content_chunk in self.formatter.format_trade_selection_stream_ai(
                     trades, 
                     intent_result.parameters.client or "the client"
                 ):
@@ -522,6 +675,33 @@ Examples of what I can do:
 • "find goldman PT trades" - Get Goldman Sachs portfolio trades
 
 Please rephrase your request or try one of the examples above."""
+    
+    async def _get_unknown_intent_message_ai(self, user_input: str) -> str:
+        """AI-powered unknown intent response"""
+        try:
+            response = await openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {
+                        "role": "system", 
+                        "content": """You are a portfolio trade assistant. The user's request wasn't recognized. 
+                        
+                        You can help with:
+                        1. Tickerize portfolio trades (e.g., 'tickerize pimco bwic', 'show me blackrock portfolio trades')
+                        
+                        Respond helpfully, explain what you can do, and provide relevant examples based on their input."""
+                    },
+                    {"role": "user", "content": f"User said: '{user_input}'. Help them understand what I can do."}
+                ],
+                temperature=0.4,
+                max_tokens=250
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            logger.error(f"AI unknown intent response failed: {e}")
+            return self._get_unknown_intent_message()  # Fallback
     
     async def process_request(self, user_input: str, session_id: Optional[str] = None) -> AssistantResponse:
         """Non-streaming processing pipeline"""
