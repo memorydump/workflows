@@ -1,13 +1,14 @@
 import json
 import re
 import logging
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, AsyncGenerator
 from dataclasses import dataclass, asdict
 from enum import Enum
 import httpx
 import asyncio
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import os
 from dotenv import load_dotenv
@@ -26,6 +27,15 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Add CORS middleware for web clients
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Configuration
 ATLAS_API_KEY = os.getenv("ATLAS_API_KEY", "your-atlas-api-key")
 ATLAS_BASE_URL = os.getenv("ATLAS_BASE_URL", "https://atlas-api.your-domain.com")
@@ -35,6 +45,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "your-openai-api-key")
 class UserInput(BaseModel):
     message: str = Field(..., description="User's input message")
     session_id: Optional[str] = Field(None, description="Optional session ID for tracking")
+    stream: bool = Field(True, description="Whether to stream the response")
 
 class IntentType(str, Enum):
     TICKERIZE = "TICKERIZE"
@@ -63,6 +74,12 @@ class PortfolioTrade(BaseModel):
     amount: Optional[str] = None
     price: Optional[str] = None
     additional_info: Optional[Dict[str, Any]] = {}
+
+class StreamChunk(BaseModel):
+    type: str  # "status", "partial", "trade", "complete", "error"
+    content: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
 
 class AssistantResponse(BaseModel):
     success: bool
@@ -299,8 +316,42 @@ class ValidationService:
 # Response Formatter Service
 class ResponseFormatter:
     @staticmethod
+    async def format_trade_selection_stream(trades: List[PortfolioTrade], client: str) -> AsyncGenerator[str, None]:
+        """Stream formatted trades for user selection"""
+        if not trades:
+            yield f"No portfolio trades found for {client}. Please check the client name or try different keywords."
+            return
+        
+        yield f"Found {len(trades)} portfolio trades for {client}:\n\n"
+        await asyncio.sleep(0.1)  # Small delay for streaming effect
+        
+        for i, trade in enumerate(trades, 1):
+            trade_info = f"{i}. **{trade.security_name}**\n"
+            trade_info += f"   - Trade ID: {trade.trade_id}\n"
+            
+            if trade.trade_type:
+                trade_info += f"   - Type: {trade.trade_type}\n"
+            
+            if trade.amount:
+                trade_info += f"   - Amount: ${trade.amount}\n"
+            
+            if trade.price:
+                trade_info += f"   - Price: ${trade.price}\n"
+            
+            if trade.additional_info:
+                for key, value in trade.additional_info.items():
+                    trade_info += f"   - {key.replace('_', ' ').title()}: {value}\n"
+            
+            trade_info += "\n"
+            
+            yield trade_info
+            await asyncio.sleep(0.2)  # Delay between trades for streaming effect
+        
+        yield "Please select the trade number(s) you want to proceed with, or ask for more details about any specific trade."
+    
+    @staticmethod
     def format_trade_selection(trades: List[PortfolioTrade], client: str) -> str:
-        """Format trades for user selection"""
+        """Format trades for non-streaming response"""
         if not trades:
             return f"No portfolio trades found for {client}. Please check the client name or try different keywords."
         
@@ -337,14 +388,149 @@ class PortfolioAssistant:
         self.validator = ValidationService()
         self.formatter = ResponseFormatter()
     
-    async def process_request(self, user_input: str, session_id: Optional[str] = None) -> AssistantResponse:
-        """Main processing pipeline"""
+    async def process_request_stream(self, user_input: str, session_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+        """Main processing pipeline with streaming"""
         try:
-            # Step 1: Classify intent
+            # Step 1: Stream status update
+            yield self._create_stream_chunk("status", "Analyzing your request...", session_id=session_id)
+            await asyncio.sleep(0.1)
+            
+            # Step 2: Classify intent
             intent_result = await self.intent_classifier.classify_intent(user_input)
             logger.info(f"Classified intent: {intent_result.intent} with confidence {intent_result.confidence}")
             
-            # Step 2: Route based on intent
+            yield self._create_stream_chunk(
+                "status", 
+                f"Identified intent: {intent_result.intent.lower()}", 
+                data={"confidence": intent_result.confidence},
+                session_id=session_id
+            )
+            await asyncio.sleep(0.1)
+            
+            # Step 3: Route based on intent
+            if intent_result.intent == IntentType.TICKERIZE:
+                async for chunk in self._handle_tickerize_stream(intent_result, session_id):
+                    yield chunk
+            else:
+                yield self._create_stream_chunk(
+                    "complete",
+                    self._get_unknown_intent_message(),
+                    session_id=session_id
+                )
+                
+        except Exception as e:
+            logger.error(f"Error processing request: {str(e)}")
+            yield self._create_stream_chunk(
+                "error",
+                "I apologize, but I'm experiencing technical difficulties. Please try again in a moment.",
+                session_id=session_id
+            )
+    
+    async def _handle_tickerize_stream(self, intent_result: IntentResult, session_id: Optional[str]) -> AsyncGenerator[str, None]:
+        """Handle tickerize requests with streaming"""
+        
+        # Validate parameters
+        validation = self.validator.validate_tickerize_parameters(intent_result.parameters)
+        
+        if not validation.valid:
+            error_message = "I need more information for the tickerize request:\n\n"
+            for error in validation.errors:
+                error_message += f"• {error}\n"
+            
+            error_message += "\nExamples:\n"
+            error_message += "• 'tickerize pimco bwic'\n"
+            error_message += "• 'show me blackrock portfolio trades'\n"
+            error_message += "• 'get goldman PT trades'"
+            
+            yield self._create_stream_chunk("error", error_message, session_id=session_id)
+            return
+        
+        # Stream status update
+        yield self._create_stream_chunk(
+            "status", 
+            f"Fetching portfolio trades for {intent_result.parameters.client}...", 
+            session_id=session_id
+        )
+        await asyncio.sleep(0.2)
+        
+        # Fetch portfolio trades
+        try:
+            trades = await self.atlas_service.fetch_portfolio_trades(intent_result.parameters)
+            
+            # Stream trade information
+            if trades:
+                yield self._create_stream_chunk(
+                    "status",
+                    f"Found {len(trades)} trades. Formatting results...",
+                    data={"trade_count": len(trades)},
+                    session_id=session_id
+                )
+                await asyncio.sleep(0.1)
+                
+                # Stream each part of the formatted response
+                async for content_chunk in self.formatter.format_trade_selection_stream(
+                    trades, 
+                    intent_result.parameters.client or "the client"
+                ):
+                    yield self._create_stream_chunk("partial", content_chunk, session_id=session_id)
+                
+                # Send final complete chunk with trade data
+                yield self._create_stream_chunk(
+                    "complete",
+                    "",
+                    data={
+                        "intent": intent_result.intent,
+                        "parameters": asdict(intent_result.parameters),
+                        "trades": [trade.dict() for trade in trades],
+                        "trade_count": len(trades)
+                    },
+                    session_id=session_id
+                )
+            else:
+                yield self._create_stream_chunk(
+                    "complete",
+                    f"No portfolio trades found for {intent_result.parameters.client}. Please check the client name or try different keywords.",
+                    session_id=session_id
+                )
+                
+        except HTTPException as e:
+            yield self._create_stream_chunk(
+                "error",
+                f"Error fetching portfolio trades: {e.detail}",
+                session_id=session_id
+            )
+    
+    def _create_stream_chunk(self, chunk_type: str, content: str = None, data: Dict[str, Any] = None, session_id: str = None) -> str:
+        """Create a streaming chunk in SSE format"""
+        chunk = StreamChunk(
+            type=chunk_type,
+            content=content,
+            data=data,
+            session_id=session_id
+        )
+        return f"data: {json.dumps(chunk.dict(), default=str)}\n\n"
+    
+    def _get_unknown_intent_message(self) -> str:
+        """Get message for unknown intents"""
+        return """I'm a portfolio trade assistant. I can help you with:
+
+1. **Tickerize portfolio trades** - Find and filter portfolio trades for specific clients
+
+Examples of what I can do:
+• "tickerize pimco bwic" - Get PIMCO BWIC trades
+• "show me blackrock portfolio trades" - Get BlackRock portfolio trades  
+• "find goldman PT trades" - Get Goldman Sachs portfolio trades
+
+Please rephrase your request or try one of the examples above."""
+    
+    async def process_request(self, user_input: str, session_id: Optional[str] = None) -> AssistantResponse:
+        """Non-streaming processing pipeline"""
+        try:
+            # Classify intent
+            intent_result = await self.intent_classifier.classify_intent(user_input)
+            logger.info(f"Classified intent: {intent_result.intent} with confidence {intent_result.confidence}")
+            
+            # Route based on intent
             if intent_result.intent == IntentType.TICKERIZE:
                 return await self._handle_tickerize(intent_result, session_id)
             else:
@@ -359,7 +545,7 @@ class PortfolioAssistant:
             )
     
     async def _handle_tickerize(self, intent_result: IntentResult, session_id: Optional[str]) -> AssistantResponse:
-        """Handle tickerize requests"""
+        """Handle tickerize requests (non-streaming)"""
         
         # Validate parameters
         validation = self.validator.validate_tickerize_parameters(intent_result.parameters)
@@ -409,17 +595,8 @@ class PortfolioAssistant:
             )
     
     def _handle_unknown_intent(self, user_input: str, session_id: Optional[str]) -> AssistantResponse:
-        """Handle unknown intents"""
-        message = """I'm a portfolio trade assistant. I can help you with:
-
-1. **Tickerize portfolio trades** - Find and filter portfolio trades for specific clients
-
-Examples of what I can do:
-• "tickerize pimco bwic" - Get PIMCO BWIC trades
-• "show me blackrock portfolio trades" - Get BlackRock portfolio trades  
-• "find goldman PT trades" - Get Goldman Sachs portfolio trades
-
-Please rephrase your request or try one of the examples above."""
+        """Handle unknown intents (non-streaming)"""
+        message = self._get_unknown_intent_message()
         
         return AssistantResponse(
             success=True,
@@ -431,10 +608,45 @@ Please rephrase your request or try one of the examples above."""
 assistant = PortfolioAssistant()
 
 # API Routes
+@app.post("/chat/stream")
+async def chat_stream_endpoint(request: UserInput):
+    """Streaming chat endpoint for real-time interactions"""
+    logger.info(f"Received streaming request: {request.message}")
+    
+    async def generate_response():
+        try:
+            async for chunk in assistant.process_request_stream(
+                user_input=request.message,
+                session_id=request.session_id
+            ):
+                yield chunk
+        except Exception as e:
+            logger.error(f"Streaming error: {str(e)}")
+            error_chunk = StreamChunk(
+                type="error",
+                content="An error occurred during streaming.",
+                session_id=request.session_id
+            )
+            yield f"data: {json.dumps(error_chunk.dict(), default=str)}\n\n"
+    
+    return StreamingResponse(
+        generate_response(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Content-Type": "text/event-stream",
+        }
+    )
+
 @app.post("/chat", response_model=AssistantResponse)
 async def chat_endpoint(request: UserInput):
-    """Main chat endpoint for user interactions"""
+    """Standard chat endpoint for non-streaming interactions"""
     logger.info(f"Received request: {request.message}")
+    
+    if request.stream:
+        # Redirect to streaming endpoint
+        return {"message": "Use /chat/stream for streaming responses"}
     
     response = await assistant.process_request(
         user_input=request.message,
@@ -454,9 +666,10 @@ async def root():
     return {
         "name": "Portfolio Trade AI Assistant",
         "version": "1.0.0",
-        "description": "AI assistant for portfolio trade operations",
+        "description": "AI assistant for portfolio trade operations with streaming support",
         "endpoints": {
-            "chat": "/chat - Main chat interface",
+            "chat": "/chat - Standard chat interface",
+            "chat_stream": "/chat/stream - Streaming chat interface",
             "health": "/health - Health check",
             "docs": "/docs - API documentation"
         }
