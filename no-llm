@@ -1,0 +1,324 @@
+import re
+from typing import TypedDict, Literal, Optional
+from langgraph.graph import StateGraph, END
+import requests
+
+# Define the state structure
+class AgentState(TypedDict):
+    user_input: str
+    client_name: Optional[str]
+    portfolio_trades: Optional[list]
+    selected_trade_id: Optional[str]
+    current_step: Literal["init", "need_client", "need_trade", "executing", "complete"]
+    response: str
+    error: Optional[str]
+
+# Regex patterns for intent matching
+PATTERNS = {
+    "tickerize": re.compile(r'\b(tickerize|ticker|tick)\b', re.IGNORECASE),
+    "client_name": re.compile(r'\b(?:client|for)\s+([A-Za-z0-9_\-]+)\b', re.IGNORECASE),
+    "trade_selection": re.compile(r'\b(?:trade|pt|portfolio\s*trade)?\s*#?(\d+)\b', re.IGNORECASE),
+    "number_only": re.compile(r'^(\d+)$'),
+}
+
+def extract_client_name(text: str) -> Optional[str]:
+    """Extract client name from user input"""
+    match = PATTERNS["client_name"].search(text)
+    if match:
+        return match.group(1)
+    return None
+
+def extract_trade_id(text: str) -> Optional[str]:
+    """Extract trade ID/number from user input"""
+    # Try specific pattern first
+    match = PATTERNS["trade_selection"].search(text)
+    if match:
+        return match.group(1)
+    
+    # Fall back to just a number
+    match = PATTERNS["number_only"].search(text.strip())
+    if match:
+        return match.group(1)
+    
+    return None
+
+def is_tickerize_intent(text: str) -> bool:
+    """Check if user wants to tickerize"""
+    return bool(PATTERNS["tickerize"].search(text))
+
+# API Helper Functions (replace with your actual endpoints)
+def fetch_portfolio_trades(client_name: str) -> list:
+    """
+    Fetch portfolio trades for a given client
+    Replace with your actual API call
+    """
+    try:
+        # Example API call
+        # response = requests.get(f"https://api.example.com/clients/{client_name}/trades")
+        # return response.json()
+        
+        # Mock data for demonstration
+        return [
+            {"id": "1", "description": "Trade A - AAPL 100 shares", "date": "2025-01-15"},
+            {"id": "2", "description": "Trade B - GOOGL 50 shares", "date": "2025-01-16"},
+            {"id": "3", "description": "Trade C - MSFT 75 shares", "date": "2025-01-17"},
+        ]
+    except Exception as e:
+        raise Exception(f"Failed to fetch trades: {str(e)}")
+
+def execute_tickerize(client_name: str, trade_id: str) -> dict:
+    """
+    Execute the tickerize action
+    Replace with your actual API call
+    """
+    try:
+        # Example API call
+        # response = requests.post(
+        #     f"https://api.example.com/tickerize",
+        #     json={"client": client_name, "trade_id": trade_id}
+        # )
+        # return response.json()
+        
+        # Mock response
+        return {
+            "status": "success",
+            "message": f"Successfully tickerized trade {trade_id} for client {client_name}",
+            "trade_id": trade_id
+        }
+    except Exception as e:
+        raise Exception(f"Failed to execute tickerize: {str(e)}")
+
+# Node Functions
+def route_initial_input(state: AgentState) -> AgentState:
+    """Process initial user input and determine next step"""
+    user_input = state["user_input"]
+    
+    # Check for tickerize intent
+    if not is_tickerize_intent(user_input):
+        state["response"] = "I can help you tickerize portfolio trades. Just say 'tickerize' to get started!"
+        state["current_step"] = "init"
+        return state
+    
+    # Try to extract client name from the input
+    client_name = extract_client_name(user_input)
+    
+    if client_name:
+        state["client_name"] = client_name
+        state["current_step"] = "need_trade"
+    else:
+        state["current_step"] = "need_client"
+        state["response"] = "Sure! Which client's portfolio trade would you like to tickerize?"
+    
+    return state
+
+def get_client_info(state: AgentState) -> AgentState:
+    """Extract client name from user input"""
+    client_name = extract_client_name(state["user_input"])
+    
+    if client_name:
+        state["client_name"] = client_name
+        state["current_step"] = "need_trade"
+    else:
+        # Try treating the entire input as client name if it's a single word/identifier
+        potential_client = state["user_input"].strip()
+        if potential_client and not any(char.isspace() for char in potential_client):
+            state["client_name"] = potential_client
+            state["current_step"] = "need_trade"
+        else:
+            state["response"] = "I didn't catch the client name. Please provide the client name."
+            state["current_step"] = "need_client"
+    
+    return state
+
+def fetch_trades(state: AgentState) -> AgentState:
+    """Fetch portfolio trades for the client"""
+    try:
+        trades = fetch_portfolio_trades(state["client_name"])
+        state["portfolio_trades"] = trades
+        
+        # Format the response
+        response = f"Here are the portfolio trades for {state['client_name']}:\n\n"
+        for trade in trades:
+            response += f"{trade['id']}. {trade['description']} ({trade['date']})\n"
+        response += "\nWhich trade would you like to tickerize? (Enter the number)"
+        
+        state["response"] = response
+        state["current_step"] = "need_trade"
+    except Exception as e:
+        state["error"] = str(e)
+        state["response"] = f"Error fetching trades: {str(e)}"
+        state["current_step"] = "complete"
+    
+    return state
+
+def get_trade_selection(state: AgentState) -> AgentState:
+    """Extract trade selection from user input"""
+    trade_id = extract_trade_id(state["user_input"])
+    
+    if trade_id and state["portfolio_trades"]:
+        # Validate the trade ID exists
+        valid_ids = [trade["id"] for trade in state["portfolio_trades"]]
+        if trade_id in valid_ids:
+            state["selected_trade_id"] = trade_id
+            state["current_step"] = "executing"
+        else:
+            state["response"] = f"Invalid trade number. Please select from: {', '.join(valid_ids)}"
+            state["current_step"] = "need_trade"
+    else:
+        state["response"] = "Please enter a valid trade number."
+        state["current_step"] = "need_trade"
+    
+    return state
+
+def execute_tickerize_action(state: AgentState) -> AgentState:
+    """Execute the tickerize action"""
+    try:
+        result = execute_tickerize(state["client_name"], state["selected_trade_id"])
+        state["response"] = result["message"]
+        state["current_step"] = "complete"
+    except Exception as e:
+        state["error"] = str(e)
+        state["response"] = f"Error executing tickerize: {str(e)}"
+        state["current_step"] = "complete"
+    
+    return state
+
+# Conditional edge functions
+def route_by_step(state: AgentState) -> str:
+    """Route to next node based on current step"""
+    step = state["current_step"]
+    
+    if step == "init":
+        return "init"
+    elif step == "need_client":
+        return "need_client"
+    elif step == "need_trade":
+        if state.get("portfolio_trades"):
+            return "need_trade"
+        else:
+            return "fetch_trades"
+    elif step == "executing":
+        return "executing"
+    elif step == "complete":
+        return END
+    
+    return END
+
+# Build the graph
+def create_tickerize_agent():
+    """Create and compile the LangGraph agent"""
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("route_initial", route_initial_input)
+    workflow.add_node("get_client", get_client_info)
+    workflow.add_node("fetch_trades", fetch_trades)
+    workflow.add_node("get_trade", get_trade_selection)
+    workflow.add_node("execute", execute_tickerize_action)
+    
+    # Set entry point
+    workflow.set_entry_point("route_initial")
+    
+    # Add edges
+    workflow.add_conditional_edges(
+        "route_initial",
+        route_by_step,
+        {
+            "init": END,
+            "need_client": "get_client",
+            "need_trade": "fetch_trades",
+            "fetch_trades": "fetch_trades",
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "get_client",
+        route_by_step,
+        {
+            "need_client": END,
+            "need_trade": "fetch_trades",
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "fetch_trades",
+        route_by_step,
+        {
+            "need_trade": END,
+            "complete": END,
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "get_trade",
+        route_by_step,
+        {
+            "need_trade": END,
+            "executing": "execute",
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "execute",
+        route_by_step,
+        {
+            "complete": END,
+        }
+    )
+    
+    return workflow.compile()
+
+# Example usage
+if __name__ == "__main__":
+    agent = create_tickerize_agent()
+    
+    # Example conversation flow
+    print("=== Example 1: Step-by-step ===")
+    
+    # Initial request
+    state = {
+        "user_input": "tickerize",
+        "client_name": None,
+        "portfolio_trades": None,
+        "selected_trade_id": None,
+        "current_step": "init",
+        "response": "",
+        "error": None,
+    }
+    
+    result = agent.invoke(state)
+    print(f"Agent: {result['response']}\n")
+    
+    # Provide client name
+    state = result.copy()
+    state["user_input"] = "client ABC123"
+    result = agent.invoke(state)
+    print(f"Agent: {result['response']}\n")
+    
+    # Select trade
+    state = result.copy()
+    state["user_input"] = "2"
+    result = agent.invoke(state)
+    print(f"Agent: {result['response']}\n")
+    
+    print("\n=== Example 2: One-shot ===")
+    
+    # One-shot with all info
+    state = {
+        "user_input": "tickerize client XYZ456",
+        "client_name": None,
+        "portfolio_trades": None,
+        "selected_trade_id": None,
+        "current_step": "init",
+        "response": "",
+        "error": None,
+    }
+    
+    result = agent.invoke(state)
+    print(f"Agent: {result['response']}\n")
+    
+    # Then select trade
+    state = result.copy()
+    state["user_input"] = "1"
+    result = agent.invoke(state)
+    print(f"Agent: {result['response']}\n")
